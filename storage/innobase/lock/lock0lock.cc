@@ -42,7 +42,7 @@ Created 5/7/1996 Heikki Tuuri
 #include "row0mysql.h"
 #include "row0vers.h"
 #include "pars0pars.h"
-
+#include "debug_sync.h"
 #include <set>
 
 #ifdef WITH_WSREP
@@ -1508,6 +1508,40 @@ lock_rec_create_low(
 	return lock;
 }
 
+#ifdef WITH_WSREP
+/** Check if both conflicting lock and other record lock are brute force
+(BF). This case is a bug so report lock information and wsrep state.
+@param[in]	conf_lock	conflicting waiting record lock
+@param[in]	lock		other waiting record lock
+@return true if both conflicting lock and waiting lock are BF
+@return false if not
+*/
+static bool wsrep_is_bf_wait(
+	const lock_t* conf_lock,
+	const lock_t* lock)
+{
+     if (UNIV_UNLIKELY(wsrep_thd_is_BF(conf_lock->trx->mysql_thd, FALSE) &&
+		       wsrep_thd_is_BF(lock->trx->mysql_thd, FALSE))) {
+	     /* There should not be two conflicting wait locks that are brute
+	     force. If there is it is a bug. */
+	     mtr_t mtr;
+	     ib::info() << "Waiting lock that has conflicting lock ";
+	     lock_rec_print(stderr, lock, mtr);
+	     ib::info() << "Conflicting lock ";
+	     lock_rec_print(stderr, conf_lock, mtr);
+	     ib::info() << "WSREP state: ";
+
+	     wsrep_report_bf_lock_wait(conf_lock->trx->mysql_thd,
+		                       conf_lock->trx->id,
+				       lock->trx->mysql_thd,
+				       lock->trx->id);
+	     return true;
+     }
+
+     return false;
+}
+#endif /* WITH_WSREP */
+
 /*********************************************************************//**
 Check if lock1 has higher priority than lock2.
 NULL has lowest priority.
@@ -1576,7 +1610,9 @@ lock_rec_insert_by_trx_age(
 	node->hash = in_lock;
 	in_lock->hash = next;
 
+	// Note that here Galera is not possible because of VATS
 	if (lock_get_wait(in_lock) && !lock_rec_has_to_wait_in_queue(in_lock)) {
+
 		lock_grant_have_trx_mutex(in_lock);
 		if (cell->node != in_lock) {
 			// Move it to the front of the queue
@@ -2043,34 +2079,14 @@ lock_rec_has_to_wait_in_queue(
 	hash = lock_hash_get(wait_lock->type_mode);
 
 	for (lock = lock_rec_get_first_on_page_addr(hash, space, page_no);
-#ifdef WITH_WSREP
-	     lock &&
-#endif
 	     lock != wait_lock;
 	     lock = lock_rec_get_next_on_page_const(lock)) {
+		ut_a(lock);
 		const byte*	p = (const byte*) &lock[1];
 
 		if (heap_no < lock_rec_get_n_bits(lock)
 		    && (p[bit_offset] & bit_mask)
 		    && lock_has_to_wait(wait_lock, lock)) {
-#ifdef WITH_WSREP
-			if (wsrep_thd_is_BF(wait_lock->trx->mysql_thd, FALSE) &&
-			    wsrep_thd_is_BF(lock->trx->mysql_thd, FALSE)) {
-
-				if (UNIV_UNLIKELY(wsrep_debug)) {
-					mtr_t mtr;
-					ib::info() << "WSREP: waiting BF trx: " << ib::hex(wait_lock->trx->id)
-						   << " query: " << wsrep_thd_query(wait_lock->trx->mysql_thd);
-					lock_rec_print(stderr, wait_lock, mtr);
-					ib::info() << "WSREP: do not wait another BF trx: " << ib::hex(lock->trx->id)
-						   << " query: " << wsrep_thd_query(lock->trx->mysql_thd);
-					lock_rec_print(stderr, lock, mtr);
-				}
-				/* don't wait for another BF lock */
-				continue;
-			}
-#endif /* WITH_WSREP */
-
 			return(lock);
 		}
 	}
@@ -2190,11 +2206,14 @@ lock_grant_and_move_on_page(ulint rec_fold, ulint space, ulint page_no)
 	/* Grant locks if there are no conflicting locks ahead.
 	 Move granted locks to the head of the list. */
 	while (lock) {
-		/* If the lock is a wait lock on this page, and it does not need to wait. */
+		/* If the lock is a wait lock on this page, and it
+		does not need to wait. Note that Galera is not
+		possible here because of VATS. */
 		if (lock_get_wait(lock)
 		    && lock->un_member.rec_lock.space == space
 		    && lock->un_member.rec_lock.page_no == page_no
 		    && !lock_rec_has_to_wait_in_queue(lock)) {
+
 			lock_grant(lock);
 
 			if (previous != NULL) {
@@ -2256,11 +2275,18 @@ static void lock_rec_dequeue_from_page(lock_t* in_lock)
 		     lock != NULL;
 		     lock = lock_rec_get_next_on_page(lock)) {
 
-			if (lock_get_wait(lock)
-			    && !lock_rec_has_to_wait_in_queue(lock)) {
-				/* Grant the lock */
-				ut_ad(lock->trx != in_lock->trx);
-				lock_grant(lock);
+			if (lock_get_wait(lock)) {
+				const lock_t* conf_lock= lock_rec_has_to_wait_in_queue(lock);
+				if (!conf_lock) {
+					/* Grant the lock */
+					ut_ad(lock->trx != in_lock->trx);
+					lock_grant(lock);
+#ifdef WITH_WSREP
+				} else if (UNIV_UNLIKELY(wsrep_is_bf_wait(conf_lock, lock))) {
+					// If there is bf wait it is a bug
+					ut_error;
+#endif /* WITH_WSREP */
+				}
 			}
 		}
 	} else {
@@ -4119,7 +4145,10 @@ lock_grant_and_move_on_rec(
 	 Move granted locks to the head of the list. */
 	for (;lock != NULL;) {
 
-		/* If the lock is a wait lock on this page, and it does not need to wait. */
+		/* If the lock is a wait lock on this page, and it
+		does not need to wait. Note that Galera is not
+		possible in this case because of VATS.
+		*/
 		if (lock->un_member.rec_lock.space == space
 			&& lock->un_member.rec_lock.page_no == page_no
 			&& lock_rec_get_nth_bit(lock, heap_no)
@@ -4171,6 +4200,16 @@ lock_rec_unlock(
 
 	heap_no = page_rec_get_heap_no(rec);
 
+	DBUG_EXECUTE_IF("sync.before_lock_rec_unlock",
+        {
+                   const char act[]=
+                     "now "
+                     "SIGNAL sync.before_lock_rec_unlock_reached "
+                     "WAIT_FOR signal.before_lock_rec_unlock";
+                   DBUG_ASSERT(!debug_sync_set_action(trx->mysql_thd,
+                                                      STRING_WITH_LEN(act)));
+        };);
+
 	lock_mutex_enter();
 	trx_mutex_enter(trx);
 
@@ -4214,12 +4253,19 @@ released:
 
 		for (lock = first_lock; lock != NULL;
 			 lock = lock_rec_get_next(heap_no, lock)) {
-			if (lock_get_wait(lock)
-				&& !lock_rec_has_to_wait_in_queue(lock)) {
+			if (lock_get_wait(lock)) {
+				const lock_t* conf_lock= lock_rec_has_to_wait_in_queue(lock);
 
-				/* Grant the lock */
-				ut_ad(trx != lock->trx);
-				lock_grant(lock);
+				if (!conf_lock) {
+					/* Grant the lock */
+					ut_ad(trx != lock->trx);
+					lock_grant(lock);
+#ifdef WITH_WSREP
+				} else if (UNIV_UNLIKELY(wsrep_is_bf_wait(conf_lock, lock))) {
+					// If there is BF wait it is a bug
+					ut_error;
+#endif /* WITH_WSREP */
+				}
 			}
 		}
 	} else {
