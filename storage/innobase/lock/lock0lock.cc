@@ -677,8 +677,8 @@ static bool wsrep_is_bf_wait(
 	     ib::error() << "WSREP state: ";
 
 	     wsrep_report_bf_lock_wait(conf_trx->mysql_thd,
-		                       conf_trx->id,
-				       lock_trx->mysql_thd,
+				       conf_trx->id);
+	     wsrep_report_bf_lock_wait(lock_trx->mysql_thd,
 				       lock_trx->id);
 	     return true;
      }
@@ -1461,11 +1461,8 @@ lock_rec_create_low(
 			trx_mutex_exit(c_lock->trx);
 
 			if (UNIV_UNLIKELY(wsrep_debug)) {
-				ib::info() << "WSREP: c_lock canceled "
-					   << ib::hex(c_lock->trx->id)
-					   << " SQL: "
-					   << wsrep_thd_query(
-						   c_lock->trx->mysql_thd);
+				wsrep_report_bf_lock_wait(trx->mysql_thd, trx->id);
+				wsrep_report_bf_lock_wait(c_lock->trx->mysql_thd, c_lock->trx->id);
 			}
 
 			/* have to bail out here to avoid lock_set_lock... */
@@ -1813,27 +1810,24 @@ lock_rec_add_to_queue(
 			= lock_rec_other_has_expl_req(
 				mode, block, false, heap_no, trx);
 #ifdef WITH_WSREP
-		if (other_lock && trx->is_wsrep() &&
-			!wsrep_thd_is_BF(trx->mysql_thd, FALSE) &&
-			!wsrep_thd_is_BF(other_lock->trx->mysql_thd, FALSE)) {
+		if (UNIV_UNLIKELY(other_lock && trx->is_wsrep())) {
+			/* Other transaction has a lock request in the
+			queue for the same record. This should be
+			possible only if thread executing this
+			transaction is BF as only BF is allowed to be
+			granted a lock even when there is other
+			transactions lock requests in the queue. */
 
-			ib::info() << "WSREP BF lock conflict for my lock:\n BF:" <<
-				((wsrep_thd_is_BF(trx->mysql_thd, FALSE)) ? "BF" : "normal") << " exec: " <<
-				wsrep_thd_client_state_str(trx->mysql_thd) << " conflict: " <<
-				wsrep_thd_transaction_state_str(trx->mysql_thd) << " seqno: " <<
-				wsrep_thd_trx_seqno(trx->mysql_thd) << " SQL: " <<
-				wsrep_thd_query(trx->mysql_thd);
-			trx_t* otrx = other_lock->trx;
-			ib::info() << "WSREP other lock:\n BF:" <<
-				((wsrep_thd_is_BF(otrx->mysql_thd, FALSE)) ? "BF" : "normal") << " exec: " <<
-				wsrep_thd_client_state_str(otrx->mysql_thd) << " conflict: " <<
-				wsrep_thd_transaction_state_str(otrx->mysql_thd) << " seqno: " <<
-				wsrep_thd_trx_seqno(otrx->mysql_thd) << " SQL: " <<
-				wsrep_thd_query(otrx->mysql_thd);
-		}
-#else
-		ut_a(!other_lock);
+			if (!wsrep_thd_is_BF(trx->mysql_thd)) {
+				/* If this transaction is not BF, this
+				case is a bug. */
+				wsrep_report_bf_lock_wait(trx->mysql_thd, trx->id);
+				wsrep_report_bf_lock_wait(other_lock->trx->mysql_thd, other_lock->trx->id);
+				ut_error;
+			}
+		} else
 #endif /* WITH_WSREP */
+		ut_a(!other_lock);
 	}
 #endif /* UNIV_DEBUG */
 
@@ -3511,11 +3505,8 @@ lock_table_create(
 			ut_list_insert(table->locks, c_lock, lock,
 				       TableLockGetNode());
 			if (UNIV_UNLIKELY(wsrep_debug)) {
-				ib::info() << "table lock BF conflict for "
-					   << ib::hex(c_lock->trx->id)
-					   << " SQL: "
-					   << wsrep_thd_query(
-						   c_lock->trx->mysql_thd);
+				wsrep_report_bf_lock_wait(trx->mysql_thd, trx->id);
+				wsrep_report_bf_lock_wait(c_lock->trx->mysql_thd, c_lock->trx->id);
 			}
 		} else {
 			ut_list_append(table->locks, lock, TableLockGetNode());
@@ -3527,6 +3518,8 @@ lock_table_create(
 			c_lock->trx->lock.was_chosen_as_deadlock_victim = TRUE;
 
 			if (UNIV_UNLIKELY(wsrep_debug)) {
+				wsrep_report_bf_lock_wait(trx->mysql_thd, trx->id);
+				wsrep_report_bf_lock_wait(c_lock->trx->mysql_thd, c_lock->trx->id);
 				wsrep_print_wait_locks(c_lock);
 			}
 
@@ -3536,14 +3529,6 @@ lock_table_create(
 			lock_cancel_waiting_and_release(
 				c_lock->trx->lock.wait_lock);
 			trx_mutex_enter(trx);
-
-			if (UNIV_UNLIKELY(wsrep_debug)) {
-				ib::info() << "WSREP: c_lock canceled "
-					   << ib::hex(c_lock->trx->id)
-					   << " SQL: "
-					   << wsrep_thd_query(
-						   c_lock->trx->mysql_thd);
-			}
 		}
 
 		trx_mutex_exit(c_lock->trx);
@@ -4897,24 +4882,9 @@ func_exit:
 			explicit granted lock. */
 
 #ifdef WITH_WSREP
-			if (other_lock->trx->is_wsrep()) {
-				if (!lock_get_wait(other_lock) ) {
-					ib::info() << "WSREP impl BF lock conflict for my impl lock:\n BF:" <<
-						((wsrep_thd_is_BF(impl_trx->mysql_thd, FALSE)) ? "BF" : "normal") << " exec: " <<
-						wsrep_thd_client_state_str(impl_trx->mysql_thd) << " conflict: " <<
-						wsrep_thd_transaction_state_str(impl_trx->mysql_thd) << " seqno: " <<
-						wsrep_thd_trx_seqno(impl_trx->mysql_thd) << " SQL: " <<
-						wsrep_thd_query(impl_trx->mysql_thd);
-
-					trx_t* otrx = other_lock->trx;
-
-					ib::info() << "WSREP other lock:\n BF:" <<
-						((wsrep_thd_is_BF(otrx->mysql_thd, FALSE)) ? "BF" : "normal")  << " exec: " <<
-						wsrep_thd_client_state_str(otrx->mysql_thd) << " conflict: " <<
-						wsrep_thd_transaction_state_str(otrx->mysql_thd) << " seqno: " <<
-						wsrep_thd_trx_seqno(otrx->mysql_thd) << " SQL: " <<
-						wsrep_thd_query(otrx->mysql_thd);
-				}
+			if (other_lock->trx->is_wsrep() && !lock_get_wait(other_lock)) {
+				wsrep_report_lock_wait(imp_trx, imp_trx->id);
+				wsrep_report_lock_wait(other_lock->trx, other_lock->trx->id);
 
 				if (!lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP,
 						       block, heap_no,
@@ -4923,9 +4893,11 @@ func_exit:
 				}
 			} else
 #endif /* WITH_WSREP */
-			ut_ad(lock_get_wait(other_lock));
-			ut_ad(lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP,
-						block, heap_no, impl_trx));
+			{
+				ut_ad(lock_get_wait(other_lock));
+				ut_ad(lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP,
+						        block, heap_no, impl_trx));
+			}
 		}
 
 		mutex_exit(&impl_trx->mutex);
@@ -4957,13 +4929,24 @@ func_exit:
 					mode, block, false, heap_no,
 					lock->trx);
 #ifdef WITH_WSREP
-			ut_a(!other_lock
-			     || wsrep_thd_is_BF(lock->trx->mysql_thd, FALSE)
-			     || wsrep_thd_is_BF(other_lock->trx->mysql_thd, FALSE));
+			if (UNIV_UNLIKELY(other_lock && trx->is_wsrep())) {
+				/* Other transaction has a lock request in the
+				queue for the same record. This should be
+				possible only if thread executing this
+				transaction is BF as only BF is allowed to be
+				granted a lock even when there is other
+				transactions lock requests in the queue. */
 
-#else
-			ut_a(!other_lock);
+				if (!wsrep_thd_is_BF(trx->mysql_thd)) {
+					/* If this transaction is not BF, this
+					case is a bug. */
+					wsrep_report_bf_lock_wait(trx->mysql_thd, trx->id);
+					wsrep_report_bf_lock_wait(other_lock->trx->mysql_thd, other_lock->trx->id);
+					ut_error;
+				}
+			} else
 #endif /* WITH_WSREP */
+			ut_a(!other_lock);
 		} else if (lock_get_wait(lock) && !lock_rec_get_gap(lock)) {
 
 			ut_a(lock_rec_has_to_wait_in_queue(lock));

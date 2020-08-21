@@ -338,40 +338,25 @@ extern "C" bool wsrep_thd_set_wsrep_aborter(THD *bf_thd, THD *victim_thd)
   return false;
 }
 
-extern "C" void wsrep_report_bf_lock_wait(const THD *conf_thd,
-                                          unsigned long long conf_trx_id,
-                                          const THD *lock_thd,
-                                          unsigned long long lock_trx_id)
+extern "C" void wsrep_report_bf_lock_wait(const THD *thd,
+                                          unsigned long long trx_id)
 {
-  WSREP_ERROR("Conflicting thread %s trx_id: %llu thread: %ld "
-              "seqno: %lld client_state: %s client_mode: %s transaction_mode: %s "
-              "applier: %d toi: %d local: %d "
-              "query: %s",
-              wsrep_thd_is_BF(conf_thd, false) ? "BF" : "normal",
-              conf_trx_id,
-              thd_get_thread_id(conf_thd),
-              wsrep_thd_trx_seqno(conf_thd),
-              wsrep_thd_client_state_str(conf_thd),
-              wsrep_thd_client_mode_str(conf_thd),
-              wsrep_thd_transaction_state_str(conf_thd),
-              wsrep_thd_is_applying(conf_thd),
-              wsrep_thd_is_toi(conf_thd),
-              wsrep_thd_is_local(conf_thd),
-              wsrep_thd_query(conf_thd));
-
-  WSREP_ERROR("Lock thread %s trx_id: %llu thread: %ld "
-              "seqno: %lld client_state: %s client_mode: %s transaction_mode: %s "
-              "applier: %d toi: %d local: %d "
-              "query: %s",
-              wsrep_thd_is_BF(lock_thd, false) ? "BF" : "normal",
-              lock_trx_id,
-              thd_get_thread_id(lock_thd),
-              wsrep_thd_trx_seqno(lock_thd),
-              wsrep_thd_client_state_str(lock_thd),
-              wsrep_thd_client_mode_str(lock_thd),
-              wsrep_thd_transaction_state_str(lock_thd),
-              wsrep_thd_is_applying(lock_thd),
-              wsrep_thd_is_toi(lock_thd),
-              wsrep_thd_is_local(lock_thd),
-              wsrep_thd_query(lock_thd));
+  if (thd)
+  {
+    WSREP_ERROR("Thread %s trx_id: %llu thread: %ld "
+                "seqno: %lld client_state: %s client_mode: %s transaction_mode: %s "
+                "applier: %d toi: %d local: %d "
+                "query: %s",
+                wsrep_thd_is_BF(thd, false) ? "BF" : "normal",
+                trx_id,
+                thd_get_thread_id(thd),
+                wsrep_thd_trx_seqno(thd),
+                wsrep_thd_client_state_str(thd),
+                wsrep_thd_client_mode_str(thd),
+                wsrep_thd_transaction_state_str(thd),
+                wsrep_thd_is_applying(thd),
+                wsrep_thd_is_toi(thd),
+                wsrep_thd_is_local(thd),
+                wsrep_thd_query(thd));
+  }
 }
