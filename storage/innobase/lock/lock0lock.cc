@@ -637,6 +637,56 @@ lock_rec_get_insert_intention(
 	return(lock->type_mode & LOCK_INSERT_INTENTION);
 }
 
+#ifdef WITH_WSREP
+/** Check if both conflicting lock and other record lock are brute force
+(BF). This case is a bug so report lock information and wsrep state.
+@param[in]	conf_trx	conflicting trx
+@param[in]	lock_trx	other waiting trx
+@param[in]	conf_lock	conflicting waiting record lock or NULL
+@param[in]	lock		other waiting record lock or NULL
+@return true if both conflicting lock and waiting lock are BF
+@return false if not
+*/
+static bool wsrep_is_bf_wait(
+	const trx_t* conf_trx,
+	const trx_t* lock_trx,
+	const lock_t* conf_lock,
+	const lock_t* lock)
+{
+     if (UNIV_UNLIKELY(wsrep_thd_is_BF(conf_trx->mysql_thd, FALSE) &&
+		       wsrep_thd_is_BF(lock_trx->mysql_thd, FALSE))) {
+	     /* There should not be two conflicting wait locks that are brute
+	     force. If there is it is a bug. */
+	     mtr_t mtr;
+	     if (lock) {
+		     ib::error() << "Waiting lock on table: "
+				 << lock->index->table->name
+				 << " index: "
+				 << lock->index->name()
+				 << " that has conflicting lock ";
+		     lock_rec_print(stderr, lock, mtr);
+	     }
+	     if (conf_lock) {
+		     ib::error() << "Conflicting lock on table: "
+				 << conf_lock->index->table->name
+				 << " index: "
+				 << conf_lock->index->name()
+				 << " that has lock ";
+		     lock_rec_print(stderr, conf_lock, mtr);
+	     }
+	     ib::error() << "WSREP state: ";
+
+	     wsrep_report_bf_lock_wait(conf_trx->mysql_thd,
+		                       conf_trx->id,
+				       lock_trx->mysql_thd,
+				       lock_trx->id);
+	     return true;
+     }
+
+     return false;
+}
+#endif /* WITH_WSREP */
+
 /*********************************************************************//**
 Checks if a lock request for a new lock has to wait for request lock2.
 @return TRUE if new lock has to wait for lock2 to be removed */
@@ -743,71 +793,15 @@ lock_rec_has_to_wait(
 	}
 
 #ifdef WITH_WSREP
-	/* if BF thread is locking and has conflict with another BF
-	   thread, we need to look at trx ordering and lock types */
-	if (wsrep_thd_is_BF(trx->mysql_thd, FALSE)
-	    && wsrep_thd_is_BF(lock2->trx->mysql_thd, FALSE)) {
-		mtr_t mtr;
-
-		if (UNIV_UNLIKELY(wsrep_debug)) {
-			ib::info() << "BF-BF lock conflict, locking: "
-				   << for_locking;
-			lock_rec_print(stderr, lock2, mtr);
-			ib::info()
-				<< " SQL1: " << wsrep_thd_query(trx->mysql_thd)
-				<< " SQL2: "
-				<< wsrep_thd_query(lock2->trx->mysql_thd);
-		}
-
+	/* There should not be two conflicting locks that are
+	brute force. If there is it is a bug. */
+	if (UNIV_UNLIKELY(wsrep_is_bf_wait(trx, lock2->trx, NULL, lock2))) {
 		if ((type_mode & LOCK_MODE_MASK) == LOCK_X
 		    && (lock2->type_mode & LOCK_MODE_MASK) == LOCK_X) {
-			if (for_locking || UNIV_UNLIKELY(wsrep_debug)) {
-				/* exclusive lock conflicts are not
-				   accepted */
-				ib::info()
-					<< "BF-BF X lock conflict,mode: "
-					<< type_mode
-					<< " supremum: " << lock_is_on_supremum
-					<< "conflicts states: my "
-					<< wsrep_thd_transaction_state_str(
-						   trx->mysql_thd)
-					<< " locked "
-					<< wsrep_thd_transaction_state_str(
-						   lock2->trx->mysql_thd);
-				lock_rec_print(stderr, lock2, mtr);
-				ib::info() << " SQL1: "
-					   << wsrep_thd_query(trx->mysql_thd)
-					   << " SQL2: "
-					   << wsrep_thd_query(
-						      lock2->trx->mysql_thd);
-
-				if (for_locking) {
-					return false;
-				}
-			}
-		} else {
-			/* if lock2->index->n_uniq <=
-			   lock2->index->n_user_defined_cols
-			   operation is on uniq index
-			*/
-			if (wsrep_debug) {
-				ib::info()
-					<< "BF conflict, modes: " << type_mode
-					<< ":" << lock2->type_mode
-					<< " idx: " << lock2->index->name()
-					<< " table: "
-					<< lock2->index->table->name
-					<< " n_uniq: " << lock2->index->n_uniq
-					<< " n_user: "
-					<< lock2->index->n_user_defined_cols
-					<< " SQL1: "
-					<< wsrep_thd_query(trx->mysql_thd)
-					<< " SQL2: "
-					<< wsrep_thd_query(
-						   lock2->trx->mysql_thd);
-			}
-			return false;
+			ib::error() << "BF-BF X lock conflict: supremum: "
+				    << lock_is_on_supremum;
 		}
+		ut_error;
 	}
 #endif /* WITH_WSREP */
 
@@ -1507,40 +1501,6 @@ lock_rec_create_low(
 
 	return lock;
 }
-
-#ifdef WITH_WSREP
-/** Check if both conflicting lock and other record lock are brute force
-(BF). This case is a bug so report lock information and wsrep state.
-@param[in]	conf_lock	conflicting waiting record lock
-@param[in]	lock		other waiting record lock
-@return true if both conflicting lock and waiting lock are BF
-@return false if not
-*/
-static bool wsrep_is_bf_wait(
-	const lock_t* conf_lock,
-	const lock_t* lock)
-{
-     if (UNIV_UNLIKELY(wsrep_thd_is_BF(conf_lock->trx->mysql_thd, FALSE) &&
-		       wsrep_thd_is_BF(lock->trx->mysql_thd, FALSE))) {
-	     /* There should not be two conflicting wait locks that are brute
-	     force. If there is it is a bug. */
-	     mtr_t mtr;
-	     ib::info() << "Waiting lock that has conflicting lock ";
-	     lock_rec_print(stderr, lock, mtr);
-	     ib::info() << "Conflicting lock ";
-	     lock_rec_print(stderr, conf_lock, mtr);
-	     ib::info() << "WSREP state: ";
-
-	     wsrep_report_bf_lock_wait(conf_lock->trx->mysql_thd,
-		                       conf_lock->trx->id,
-				       lock->trx->mysql_thd,
-				       lock->trx->id);
-	     return true;
-     }
-
-     return false;
-}
-#endif /* WITH_WSREP */
 
 /*********************************************************************//**
 Check if lock1 has higher priority than lock2.
@@ -2282,7 +2242,8 @@ static void lock_rec_dequeue_from_page(lock_t* in_lock)
 					ut_ad(lock->trx != in_lock->trx);
 					lock_grant(lock);
 #ifdef WITH_WSREP
-				} else if (UNIV_UNLIKELY(wsrep_is_bf_wait(conf_lock, lock))) {
+				} else if (UNIV_UNLIKELY(wsrep_is_bf_wait(conf_lock->trx,
+							lock->trx, conf_lock, lock))) {
 					// If there is bf wait it is a bug
 					ut_error;
 #endif /* WITH_WSREP */
@@ -4261,7 +4222,8 @@ released:
 					ut_ad(trx != lock->trx);
 					lock_grant(lock);
 #ifdef WITH_WSREP
-				} else if (UNIV_UNLIKELY(wsrep_is_bf_wait(conf_lock, lock))) {
+				} else if (UNIV_UNLIKELY(wsrep_is_bf_wait(conf_lock->trx,
+							lock->trx, conf_lock, lock))) {
 					// If there is BF wait it is a bug
 					ut_error;
 #endif /* WITH_WSREP */
