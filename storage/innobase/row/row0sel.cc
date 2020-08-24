@@ -5088,7 +5088,7 @@ no_gap_lock:
 			a deadlock and the transaction had to wait then
 			release the lock it is waiting on. */
 
-			err = lock_trx_handle_wait(trx);
+			err = lock_trx_handle_wait(trx, true);
 
 			switch (err) {
 			case DB_SUCCESS:

@@ -1813,14 +1813,14 @@ lock_rec_add_to_queue(
 		if (UNIV_UNLIKELY(other_lock && trx->is_wsrep())) {
 			/* Other transaction has a lock request in the
 			queue for the same record. This should be
-			possible only if thread executing this
+			possible only if thread executing
 			transaction is BF as only BF is allowed to be
 			granted a lock even when there is other
 			transactions lock requests in the queue. */
 
-			if (!wsrep_thd_is_BF(trx->mysql_thd)) {
-				/* If this transaction is not BF, this
-				case is a bug. */
+			if (!(wsrep_thd_is_BF(trx->mysql_thd, FALSE)
+			      || wsrep_thd_is_BF(other_lock->trx->mysql_thd, FALSE))) {
+				/* If it is not BF, this case is a bug. */
 				wsrep_report_bf_lock_wait(trx->mysql_thd, trx->id);
 				wsrep_report_bf_lock_wait(other_lock->trx->mysql_thd, other_lock->trx->id);
 				ut_error;
@@ -4883,8 +4883,8 @@ func_exit:
 
 #ifdef WITH_WSREP
 			if (other_lock->trx->is_wsrep() && !lock_get_wait(other_lock)) {
-				wsrep_report_lock_wait(imp_trx, imp_trx->id);
-				wsrep_report_lock_wait(other_lock->trx, other_lock->trx->id);
+				wsrep_report_bf_lock_wait(impl_trx->mysql_thd, impl_trx->id);
+				wsrep_report_bf_lock_wait(other_lock->trx->mysql_thd, other_lock->trx->id);
 
 				if (!lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP,
 						       block, heap_no,
@@ -4929,18 +4929,18 @@ func_exit:
 					mode, block, false, heap_no,
 					lock->trx);
 #ifdef WITH_WSREP
-			if (UNIV_UNLIKELY(other_lock && trx->is_wsrep())) {
+			if (UNIV_UNLIKELY(other_lock && lock->trx->is_wsrep())) {
 				/* Other transaction has a lock request in the
 				queue for the same record. This should be
-				possible only if thread executing this
+				possible only if thread executing
 				transaction is BF as only BF is allowed to be
 				granted a lock even when there is other
 				transactions lock requests in the queue. */
 
-				if (!wsrep_thd_is_BF(trx->mysql_thd)) {
-					/* If this transaction is not BF, this
-					case is a bug. */
-					wsrep_report_bf_lock_wait(trx->mysql_thd, trx->id);
+				if (!(wsrep_thd_is_BF(lock->trx->mysql_thd, FALSE)
+				      || wsrep_thd_is_BF(other_lock->trx->mysql_thd, FALSE))) {
+					/* If no BF, this case is a bug. */
+					wsrep_report_bf_lock_wait(lock->trx->mysql_thd, lock->trx->id);
 					wsrep_report_bf_lock_wait(other_lock->trx->mysql_thd, other_lock->trx->id);
 					ut_error;
 				}
@@ -6248,11 +6248,13 @@ the wait lock.
 dberr_t
 lock_trx_handle_wait(
 /*=================*/
-	trx_t*	trx)	/*!< in/out: trx lock state */
+	trx_t*	trx,	/*!< in/out: trx lock state */
+	bool	search)	/*!< in: true if search */
 {
 #ifdef WITH_WSREP
-	/* We already own mutexes */
-	if (trx->lock.was_chosen_as_wsrep_victim) {
+	/* We already own mutexes if we are not in search,
+	see row0sel.cc */
+	if (trx->lock.was_chosen_as_wsrep_victim /* &&  !search*/) {
 		return lock_trx_handle_wait_low(trx);
 	}
 #endif /* WITH_WSREP */
